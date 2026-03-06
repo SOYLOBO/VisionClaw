@@ -29,8 +29,6 @@
 		9D998C882F5AB48400E6A2CC /* CursorControlBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C812F5AB48400E6A2CC /* CursorControlBridge.swift */; };
 		9D998C892F5AB48400E6A2CC /* GazeControlViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C832F5AB48400E6A2CC /* GazeControlViewModel.swift */; };
 		9D998C8A2F5AB48400E6A2CC /* GazeOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C842F5AB48400E6A2CC /* GazeOverlayView.swift */; };
-		9D998C8B2F5AB48400E6A2CC /* HomographyService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C852F5AB48400E6A2CC /* HomographyService.swift */; };
-		9D998C8C2F5AB48400E6A2CC /* MarkerDetectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C862F5AB48400E6A2CC /* MarkerDetectionService.swift */; };
 		9D998C8D2F5AB48400E6A2CC /* GazeConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D998C822F5AB48400E6A2CC /* GazeConfig.swift */; };
 		9DD6CAAF2F3C426600ED7098 /* Secrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DD6CAAD2F3C426600ED7098 /* Secrets.swift */; };
 		9DD6CAFE2F3C62DA00ED7098 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 9DD6CAFD2F3C62DA00ED7098 /* WebRTC */; };
@@ -443,8 +441,6 @@
 				9D998C882F5AB48400E6A2CC /* CursorControlBridge.swift in Sources */,
 				9D998C892F5AB48400E6A2CC /* GazeControlViewModel.swift in Sources */,
 				9D998C8A2F5AB48400E6A2CC /* GazeOverlayView.swift in Sources */,
-				9D998C8B2F5AB48400E6A2CC /* HomographyService.swift in Sources */,
-				9D998C8C2F5AB48400E6A2CC /* MarkerDetectionService.swift in Sources */,
 				9D998C8D2F5AB48400E6A2CC /* GazeConfig.swift in Sources */,
 				9DD6CB082F3C637D00ED7098 /* SignalingClient.swift in Sources */,
 				9DD6CB092F3C637D00ED7098 /* WebRTCClient.swift in Sources */,

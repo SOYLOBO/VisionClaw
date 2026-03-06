@@ -12,10 +12,10 @@ class HomographyService {
     markerCenters: [String: CGPoint],
     screenSize: CGSize
   ) -> Bool {
-    guard let tl = markerCenters[GazeConfig.markerTopLeft],
-          let tr = markerCenters[GazeConfig.markerTopRight],
-          let bl = markerCenters[GazeConfig.markerBottomLeft],
-          let br = markerCenters[GazeConfig.markerBottomRight]
+    guard let tl = markerCenters["TL"],
+          let tr = markerCenters["TR"],
+          let bl = markerCenters["BL"],
+          let br = markerCenters["BR"]
     else {
       return false
     }

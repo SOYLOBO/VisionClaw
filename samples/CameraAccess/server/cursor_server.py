@@ -873,8 +873,17 @@ class GazeTracker:
         print("[Cursor] 60fps interpolation started", flush=True)
 
     def _cursor_interpolation_loop(self):
-        """60fps: lerp actual cursor position toward Kalman target."""
+        """60fps: critically damped spring for smooth cursor movement.
+
+        Instead of lerp (which causes velocity pulses on each Kalman update),
+        this uses a spring-damper that smoothly accelerates and decelerates.
+        Velocity changes are gradual, eliminating the periodic 'pulse' feeling.
+        """
         interval = 1.0 / 60.0
+        vx, vy = 0.0, 0.0
+        # Spring parameters: omega = natural frequency, zeta = 1.0 = critical damping
+        omega = 12.0  # Higher = faster response (but >15 can feel twitchy)
+
         while self._cursor_thread_active:
             with self._cursor_lock:
                 target = self._cursor_target
@@ -887,14 +896,23 @@ class GazeTracker:
                 dy = ty - cy
                 dist = math.sqrt(dx * dx + dy * dy)
 
-                if dist > 0.5:
-                    # Adaptive lerp: faster for large distances
-                    lerp = 0.25 if dist < 100 else 0.4
-                    nx = cx + dx * lerp
-                    ny = cy + dy * lerp
+                if dist > 0.3:
+                    # Critically damped spring: zeta = 1.0
+                    # acceleration = omega^2 * (target - pos) - 2 * omega * velocity
+                    dt = interval
+                    ax = omega * omega * dx - 2.0 * omega * vx
+                    ay = omega * omega * dy - 2.0 * omega * vy
+                    vx += ax * dt
+                    vy += ay * dt
+                    nx = cx + vx * dt
+                    ny = cy + vy * dt
                     move_mouse(nx, ny)
                     with self._cursor_lock:
                         self._cursor_current = (nx, ny)
+                else:
+                    # Close enough — damp velocity to zero
+                    vx *= 0.8
+                    vy *= 0.8
 
             time.sleep(interval)
 

@@ -163,8 +163,8 @@ class GazeControlViewModel: ObservableObject {
 
     guard dist > 0.5 else { return }  // Close enough, skip
 
-    // Lerp factor per frame: ~20% per frame at 60fps gives smooth catch-up
-    let lerp: CGFloat = 0.15
+    // Adaptive lerp: fast catch-up when far, smooth when close
+    let lerp: CGFloat = dist > 200 ? 0.5 : dist > 50 ? 0.3 : 0.15
     let next = CGPoint(
       x: current.x + dx * lerp,
       y: current.y + dy * lerp

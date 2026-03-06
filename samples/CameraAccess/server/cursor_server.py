@@ -4,13 +4,14 @@ macOS Cursor Control HTTP Server for Gaze-Based Window Control.
 
 Accepts JSON commands from the iOS app and controls the Mac cursor
 using CoreGraphics events. Also provides a /locate endpoint that uses
-ORB feature matching between a camera frame and the screen screenshot
-to determine where on screen the camera is pointing.
+SuperPoint + LightGlue neural feature matching between a camera frame
+and per-monitor screenshots to determine where on screen the camera
+is pointing. Works robustly across viewing distances and angles.
 
 Requires Accessibility permission for Terminal.
 
 Usage:
-  pip install flask pyobjc-framework-Quartz opencv-python-headless mss numpy
+  pip install flask pyobjc-framework-Quartz opencv-python-headless mss numpy torch lightglue
   python cursor_server.py
 
 Endpoints:
@@ -23,14 +24,20 @@ Endpoints:
   GET  /health    -> {"status": "ok"}
 """
 
+import ssl
 import threading
 import time
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import cv2
 import mss
 import numpy as np
 import Quartz
+import torch
 from flask import Flask, request, jsonify
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import numpy_image_to_torch
 
 app = Flask(__name__)
 
@@ -206,83 +213,69 @@ def handle_health():
 
 
 # ---------------------------------------------------------------------------
-# Screenshot SIFT matching for /locate
+# SuperPoint + LightGlue neural feature matching for /locate
 # ---------------------------------------------------------------------------
 
-class ScreenshotCache:
-    """Caches a screenshot with pre-computed SIFT features for fast matching.
+_device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+_extractor = SuperPoint(max_num_keypoints=1024).eval().to(_device)
+_matcher = LightGlue(features="superpoint").eval().to(_device)
 
-    SIFT is scale-invariant, so it matches reliably even when the camera
-    is far from the screen (unlike ORB which needs close-up views).
+
+class ScreenshotCache:
+    """Per-monitor screenshot cache with SuperPoint features.
+
+    Uses SuperPoint (learned keypoints, scale/rotation invariant) +
+    LightGlue (adaptive neural matcher) for robust matching at any
+    viewing distance. Features are extracted per-monitor to avoid
+    wasting keypoints on black inter-monitor gaps.
     """
 
-    def __init__(self, refresh_interval=1.0, max_features=5000):
+    def __init__(self, refresh_interval=1.0):
         self.refresh_interval = refresh_interval
-        self.max_features = max_features
-        self.sift = cv2.SIFT_create(nfeatures=max_features)
-        # FLANN matcher is much faster than brute-force for SIFT's float descriptors
-        index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
         self._lock = threading.Lock()
-        self._keypoints = None
-        self._descriptors = None
+        # List of (monitor_dict, features_dict, scale_factor) per monitor
+        self._monitors = []
         self._last_refresh = 0
-        self._screen_w = 0
-        self._screen_h = 0
-        self._scale_factor = 1.0
-        # Virtual screen offset (logical coords) — can be negative for multi-monitor
-        self._origin_x = 0
-        self._origin_y = 0
+        self._last_matched_idx = 0  # Prioritize last matched monitor
 
     def _refresh_if_needed(self):
         now = time.time()
         if now - self._last_refresh < self.refresh_interval:
             return
-        with mss.mss() as sct:
-            # monitors[0] is the virtual screen spanning ALL monitors
-            monitor = sct.monitors[0]
-            origin_x = monitor["left"]
-            origin_y = monitor["top"]
-            screenshot = sct.grab(monitor)
-            img = np.array(screenshot)[:, :, :3]  # Drop alpha channel
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            # Get primary monitor width for Retina scale detection
-            primary_w = sct.monitors[1]["width"] if len(sct.monitors) > 1 else monitor["width"]
-
-        # Detect Retina: mss captures at physical pixels, CGDisplay returns logical
+        monitors = []
+        # Detect Retina scale from primary monitor
         logical_w = Quartz.CGDisplayPixelsWide(Quartz.CGMainDisplayID())
-        scale = primary_w / logical_w if logical_w > 0 else 1.0
 
-        img_h, img_w = gray.shape[:2]
+        with mss.mss() as sct:
+            primary_w = sct.monitors[1]["width"] if len(sct.monitors) > 1 else 1
+            scale = primary_w / logical_w if logical_w > 0 else 1.0
 
-        kp, desc = self.sift.detectAndCompute(gray, None)
+            for mon in sct.monitors[1:]:  # Skip virtual screen [0]
+                screenshot = sct.grab(mon)
+                img = np.array(screenshot)[:, :, :3]
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                tensor = numpy_image_to_torch(gray).to(_device)
+                with torch.no_grad():
+                    feats = _extractor.extract(tensor)
+                monitors.append((mon, feats, scale))
+
         with self._lock:
-            self._keypoints = kp
-            self._descriptors = desc
-            self._screen_w = img_w
-            self._screen_h = img_h
-            self._scale_factor = scale
-            self._origin_x = origin_x
-            self._origin_y = origin_y
+            self._monitors = monitors
             self._last_refresh = now
 
     def locate(self, camera_jpeg_bytes, min_matches=15):
-        """Match camera JPEG against cached screenshot.
+        """Match camera JPEG against all monitors using SuperPoint + LightGlue.
 
-        Returns (screen_x, screen_y, match_count, confidence) in logical
-        pixels (matching CGEvent coordinate space), or None on failure.
+        Returns (screen_x, screen_y, match_count, confidence) in global
+        CGEvent coordinates, or None on failure.
         """
         self._refresh_if_needed()
 
         with self._lock:
-            if self._descriptors is None or len(self._keypoints) < min_matches:
+            if not self._monitors:
                 return None
-            screen_kp = list(self._keypoints)
-            screen_desc = self._descriptors.copy()
-            scale = self._scale_factor
-            origin_x = self._origin_x
-            origin_y = self._origin_y
+            monitors = list(self._monitors)
+            start_idx = self._last_matched_idx
 
         # Decode camera JPEG
         nparr = np.frombuffer(camera_jpeg_bytes, np.uint8)
@@ -291,57 +284,69 @@ class ScreenshotCache:
             return None
 
         cam_h, cam_w = cam_img.shape[:2]
+        cam_tensor = numpy_image_to_torch(cam_img).to(_device)
 
-        # Extract SIFT features from camera frame
-        cam_kp, cam_desc = self.sift.detectAndCompute(cam_img, None)
-        if cam_desc is None or len(cam_kp) < min_matches:
-            return None
+        with torch.no_grad():
+            cam_feats = _extractor.extract(cam_tensor)
 
-        # KNN match + Lowe's ratio test
-        matches = self.flann.knnMatch(cam_desc, screen_desc, k=2)
-        good = []
-        for pair in matches:
-            if len(pair) == 2:
-                m, n = pair
-                if m.distance < 0.75 * n.distance:
-                    good.append(m)
+        # Try last matched monitor first, then others
+        order = [start_idx] + [i for i in range(len(monitors)) if i != start_idx]
 
-        if len(good) < min_matches:
-            return None
+        for idx in order:
+            mon, screen_feats, scale = monitors[idx]
 
-        src_pts = np.float32([cam_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst_pts = np.float32([screen_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            with torch.no_grad():
+                result = _matcher({"image0": screen_feats, "image1": cam_feats})
 
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        if H is None:
-            return None
+            matches = result["matches0"][0]
+            valid = matches > -1
+            n_matches = int(valid.sum().item())
 
-        inliers = int(mask.sum()) if mask is not None else 0
-        if inliers < min_matches:
-            return None
+            if n_matches < min_matches:
+                continue
 
-        # Map camera center through homography
-        cam_center = np.float32([[cam_w / 2, cam_h / 2]]).reshape(-1, 1, 2)
-        screen_pt = cv2.perspectiveTransform(cam_center, H)
-        sx = float(screen_pt[0][0][0])
-        sy = float(screen_pt[0][0][1])
+            # Get matched keypoint coordinates
+            kps0 = screen_feats["keypoints"][0][valid].cpu().numpy()
+            kps1 = cam_feats["keypoints"][0][matches[valid]].cpu().numpy()
 
-        # Convert from physical pixels to logical pixels and add virtual screen offset
-        # This gives us global CGEvent coordinates (primary display origin = 0,0)
-        sx = origin_x + sx / scale
-        sy = origin_y + sy / scale
+            src_pts = kps1.reshape(-1, 1, 2)
+            dst_pts = kps0.reshape(-1, 1, 2)
 
-        # Clamp to virtual screen bounds
-        logical_w = self._screen_w / scale
-        logical_h = self._screen_h / scale
-        sx = max(origin_x, min(origin_x + logical_w, sx))
-        sy = max(origin_y, min(origin_y + logical_h, sy))
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if H is None:
+                continue
 
-        confidence = inliers / len(good) if good else 0.0
-        return (sx, sy, inliers, confidence)
+            inliers = int(mask.sum()) if mask is not None else 0
+            if inliers < min_matches:
+                continue
+
+            # Map camera center through homography -> monitor pixel coords
+            cam_center = np.float32([[cam_w / 2, cam_h / 2]]).reshape(-1, 1, 2)
+            screen_pt = cv2.perspectiveTransform(cam_center, H)
+            sx = float(screen_pt[0][0][0])
+            sy = float(screen_pt[0][0][1])
+
+            # Convert to global CGEvent coordinates
+            # screen_pt is in the monitor's pixel space; add monitor origin
+            sx = mon["left"] + sx / scale
+            sy = mon["top"] + sy / scale
+
+            # Clamp to this monitor's bounds
+            mon_w = mon["width"] / scale
+            mon_h = mon["height"] / scale
+            sx = max(mon["left"], min(mon["left"] + mon_w, sx))
+            sy = max(mon["top"], min(mon["top"] + mon_h, sy))
+
+            with self._lock:
+                self._last_matched_idx = idx
+
+            confidence = inliers / n_matches if n_matches else 0.0
+            return (sx, sy, inliers, confidence)
+
+        return None
 
 
-screenshot_cache = ScreenshotCache(refresh_interval=1.0, max_features=5000)
+screenshot_cache = ScreenshotCache(refresh_interval=1.0)
 
 
 @app.route("/locate", methods=["POST"])

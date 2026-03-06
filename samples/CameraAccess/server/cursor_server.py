@@ -43,10 +43,12 @@ import time
 ssl._create_default_https_context = ssl._create_unverified_context
 
 import cv2
+import mediapipe as mp
 import mss
 import numpy as np
 import Quartz
 import torch
+from enum import Enum
 from flask import Flask, request, jsonify
 from lightglue import SuperPoint
 from lightglue.utils import numpy_image_to_torch
@@ -355,18 +357,134 @@ def extract_features(gray_img):
 
 
 def decode_camera_frame(jpeg_bytes):
-    """Decode JPEG to grayscale, downscale if needed. Returns (gray, h, w)."""
+    """Decode JPEG to grayscale + color, downscale if needed.
+
+    Returns (gray, color_rgb, h, w). color_rgb is for MediaPipe hand detection.
+    """
     nparr = np.frombuffer(jpeg_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        return None, 0, 0
-    h, w = img.shape[:2]
+    color_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if color_bgr is None:
+        return None, None, 0, 0
+    h, w = color_bgr.shape[:2]
     max_dim = max(h, w)
     if max_dim > _MAX_CAM_DIM:
         s = _MAX_CAM_DIM / max_dim
-        img = cv2.resize(img, (int(w * s), int(h * s)))
-        h, w = img.shape[:2]
-    return img, h, w
+        color_bgr = cv2.resize(color_bgr, (int(w * s), int(h * s)))
+        h, w = color_bgr.shape[:2]
+    gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
+    color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+    return gray, color_rgb, h, w
+
+
+# ---------------------------------------------------------------------------
+# Hand pinch detection (MediaPipe)
+# ---------------------------------------------------------------------------
+
+class PinchState(Enum):
+    OPEN = "OPEN"
+    HELD = "HELD"
+    DRAGGING = "DRAGGING"
+
+
+class PinchDetector:
+    """Detect thumb-index pinch gesture from MediaPipe hand landmarks."""
+
+    PINCH_CLOSE = 0.045   # Normalized distance to trigger pinch
+    PINCH_OPEN = 0.07     # Distance to release (hysteresis)
+    DEBOUNCE_FRAMES = 2   # Consecutive frames before confirming
+    DRAG_HOLD_MS = 300    # Hold time before drag mode
+    COOLDOWN_MS = 200     # Min time between clicks
+
+    def __init__(self):
+        self.state = PinchState.OPEN
+        self._close_count = 0       # Consecutive frames below threshold
+        self._pinch_start = 0.0     # Time when pinch confirmed
+        self._last_click = 0.0      # Last click time (cooldown)
+        self._is_dragging = False
+        self.distance = 1.0         # Last measured distance
+        self.hand_detected = False
+        self.last_action = None
+        self.last_action_time = 0.0
+
+    def update(self, thumb_tip, index_tip):
+        """Update state with new landmark positions.
+
+        thumb_tip/index_tip: (x, y) normalized 0-1 coordinates.
+        Returns: ("click", ) | ("drag_start", ) | ("drag_end", ) | None
+        """
+        now = time.time()
+        dx = thumb_tip[0] - index_tip[0]
+        dy = thumb_tip[1] - index_tip[1]
+        self.distance = math.sqrt(dx * dx + dy * dy)
+
+        if self.state == PinchState.OPEN:
+            if self.distance < self.PINCH_CLOSE:
+                self._close_count += 1
+                if self._close_count >= self.DEBOUNCE_FRAMES:
+                    self.state = PinchState.HELD
+                    self._pinch_start = now
+                    self._is_dragging = False
+                    print(f"[Hand] Pinch detected (dist={self.distance:.3f})", flush=True)
+            else:
+                self._close_count = 0
+            return None
+
+        elif self.state == PinchState.HELD:
+            if self.distance > self.PINCH_OPEN:
+                # Released - was it a click or end of drag?
+                self.state = PinchState.OPEN
+                self._close_count = 0
+                if self._is_dragging:
+                    self._is_dragging = False
+                    self.last_action = "drag_end"
+                    self.last_action_time = now
+                    print("[Hand] Drag end", flush=True)
+                    return ("drag_end",)
+                elif now - self._last_click > self.COOLDOWN_MS / 1000.0:
+                    self._last_click = now
+                    self.last_action = "click"
+                    self.last_action_time = now
+                    print("[Hand] Click", flush=True)
+                    return ("click",)
+                return None
+            # Still held - check if should transition to drag
+            hold_ms = (now - self._pinch_start) * 1000
+            if hold_ms > self.DRAG_HOLD_MS and not self._is_dragging:
+                self._is_dragging = True
+                self.state = PinchState.DRAGGING
+                self.last_action = "drag_start"
+                self.last_action_time = now
+                print(f"[Hand] Drag start (held {hold_ms:.0f}ms)", flush=True)
+                return ("drag_start",)
+            return None
+
+        elif self.state == PinchState.DRAGGING:
+            if self.distance > self.PINCH_OPEN:
+                self.state = PinchState.OPEN
+                self._close_count = 0
+                self._is_dragging = False
+                self.last_action = "drag_end"
+                self.last_action_time = now
+                print("[Hand] Drag end", flush=True)
+                return ("drag_end",)
+            return None
+
+        return None
+
+    def on_hand_lost(self):
+        """Call when no hand is detected - auto-release any active drag."""
+        self.hand_detected = False
+        if self._is_dragging or self.state == PinchState.DRAGGING:
+            self.state = PinchState.OPEN
+            self._close_count = 0
+            self._is_dragging = False
+            self.last_action = "drag_end"
+            self.last_action_time = time.time()
+            print("[Hand] Hand lost - auto drag end", flush=True)
+            return ("drag_end",)
+        self.state = PinchState.OPEN
+        self._close_count = 0
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +601,7 @@ class GazeTracker:
         # Server-side cursor interpolation (60fps smooth movement)
         self._cursor_target = None  # Where Kalman says we should be
         self._cursor_current = None  # Where the cursor actually is (lerped)
+        self._cursor_vel_hint = None  # Kalman velocity hint for spring
         self._cursor_lock = threading.Lock()
         self._cursor_thread_active = False
 
@@ -491,6 +610,14 @@ class GazeTracker:
         self._screen_last_matched_idx = 0  # Prioritize last matched monitor
         self._screen_lock = threading.Lock()
         self._screen_capture_active = False
+
+        # Hand detection (MediaPipe)
+        self._hand_frame = None
+        self._hand_frame_lock = threading.Lock()
+        self._hand_frame_event = threading.Event()
+        self._hand_enabled = True
+        self._hand_thread_active = False
+        self._pinch = PinchDetector()
 
         # Load saved calibration if exists
         self._load_calibration()
@@ -557,7 +684,7 @@ class GazeTracker:
             return {"error": "All points captured"}
 
         # Decode and extract features
-        gray, h, w = decode_camera_frame(jpeg_bytes)
+        gray, _color, h, w = decode_camera_frame(jpeg_bytes)
         if gray is None:
             return {"error": "Bad JPEG"}
 
@@ -631,9 +758,15 @@ class GazeTracker:
         if not self.is_calibrated():
             return None
 
-        gray, cam_h, cam_w = decode_camera_frame(jpeg_bytes)
+        gray, color_rgb, cam_h, cam_w = decode_camera_frame(jpeg_bytes)
         if gray is None:
             return None
+
+        # Share color frame with hand detection thread (non-blocking)
+        if color_rgb is not None and self._hand_enabled:
+            with self._hand_frame_lock:
+                self._hand_frame = color_rgb
+            self._hand_frame_event.set()
 
         t0 = time.time()
         self._frame_count += 1
@@ -646,10 +779,10 @@ class GazeTracker:
             flow_dx, flow_dy = self._compute_optical_flow(self._prev_gray, gray)
             if flow_dx != 0 or flow_dy != 0:
                 # Apply flow to Kalman state, dampened to reduce drift.
-                # 0.6 keeps responsiveness while filtering accumulated noise.
+                # 0.8 keeps most responsiveness while filtering accumulated noise.
                 self._kalman.apply_flow(
-                    -flow_dx * self._scale_factor * 0.6,
-                    -flow_dy * self._scale_factor * 0.6,
+                    -flow_dx * self._scale_factor * 0.8,
+                    -flow_dy * self._scale_factor * 0.8,
                 )
 
         # -- Anchor/screen matching: periodic absolute correction --
@@ -725,7 +858,7 @@ class GazeTracker:
         # Project ahead by ~50ms to compensate for network + processing delay.
         # The frame we just processed was captured ~50ms ago, so predict where
         # the user is looking NOW, not where they were looking THEN.
-        kx, ky = self._kalman.position(lead_time=0.05)
+        kx, ky = self._kalman.position(lead_time=0.12)
 
         # Clamp to screen bounds
         scr_ox, scr_oy, scr_w, scr_h = get_screen_size()
@@ -734,7 +867,10 @@ class GazeTracker:
         self._current_pos = (kx, ky)
 
         # Set target for 60fps interpolation thread (smooth movement)
-        self.set_cursor_target(kx, ky)
+        # Pass Kalman velocity so spring can start moving immediately
+        kvx = float(self._kalman.x[2])
+        kvy = float(self._kalman.x[3])
+        self.set_cursor_target(kx, ky, vel_x=kvx, vel_y=kvy)
 
         elapsed_ms = (time.time() - t0) * 1000
         if source:
@@ -888,7 +1024,7 @@ class GazeTracker:
 
         # Dead zone: filter camera sensor + JPEG noise but allow real movements
         mag = math.sqrt(dx * dx + dy * dy)
-        if mag < 1.0:
+        if mag < 1.5:
             return 0.0, 0.0
 
         return dx, dy
@@ -914,12 +1050,22 @@ class GazeTracker:
         interval = 1.0 / 60.0
         vx, vy = 0.0, 0.0
         # Spring parameters: omega = natural frequency, zeta = 1.0 = critical damping
-        omega = 10.0  # Higher = faster response (but >12 can feel twitchy)
+        omega = 11.0  # Higher = faster response (but >12 can feel twitchy)
 
         while self._cursor_thread_active:
             with self._cursor_lock:
                 target = self._cursor_target
                 current = self._cursor_current
+                vel_hint = getattr(self, '_cursor_vel_hint', None)
+                if vel_hint is not None:
+                    self._cursor_vel_hint = None
+
+            # Apply Kalman velocity hint to spring (reduces lag on direction changes)
+            if vel_hint is not None:
+                hvx, hvy = vel_hint
+                # Blend: 50% spring velocity + 50% Kalman velocity
+                vx = vx * 0.5 + hvx * 0.5
+                vy = vy * 0.5 + hvy * 0.5
 
             if target is not None and current is not None:
                 tx, ty = target
@@ -948,10 +1094,16 @@ class GazeTracker:
 
             time.sleep(interval)
 
-    def set_cursor_target(self, x, y):
-        """Set the target position for the interpolation thread."""
+    def set_cursor_target(self, x, y, vel_x=None, vel_y=None):
+        """Set the target position for the interpolation thread.
+
+        vel_x/vel_y: optional Kalman velocity hint (px/s) so the spring
+        can start moving in the right direction immediately.
+        """
         with self._cursor_lock:
             self._cursor_target = (x, y)
+            if vel_x is not None and vel_y is not None:
+                self._cursor_vel_hint = (vel_x, vel_y)
             # First point: jump directly
             if self._cursor_current is None:
                 self._cursor_current = (x, y)
@@ -1041,6 +1193,82 @@ class GazeTracker:
                 print(f"[ScreenContent] Capture error: {e}", flush=True)
 
             time.sleep(2.0)
+
+    # -- Hand detection (MediaPipe) --
+
+    def start_hand_detection(self):
+        """Start background thread for MediaPipe hand detection."""
+        if self._hand_thread_active:
+            return
+        self._hand_thread_active = True
+        t = threading.Thread(target=self._hand_detection_loop, daemon=True)
+        t.start()
+        print("[Hand] Detection started (MediaPipe Hands)", flush=True)
+
+    def _hand_detection_loop(self):
+        """Background: detect hands and process pinch gestures."""
+        mp_hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        no_hand_count = 0
+
+        while self._hand_thread_active:
+            # Wait for a new frame (timeout 1s to allow clean shutdown)
+            if not self._hand_frame_event.wait(timeout=1.0):
+                continue
+            self._hand_frame_event.clear()
+
+            if not self._hand_enabled:
+                continue
+
+            with self._hand_frame_lock:
+                frame = self._hand_frame
+                self._hand_frame = None
+
+            if frame is None:
+                continue
+
+            results = mp_hands.process(frame)
+
+            if results.multi_hand_landmarks:
+                no_hand_count = 0
+                self._pinch.hand_detected = True
+                hand = results.multi_hand_landmarks[0]
+                thumb_tip = hand.landmark[4]
+                index_tip = hand.landmark[8]
+
+                action = self._pinch.update(
+                    (thumb_tip.x, thumb_tip.y),
+                    (index_tip.x, index_tip.y),
+                )
+
+                if action is not None:
+                    self._execute_pinch_action(action)
+            else:
+                no_hand_count += 1
+                # Only trigger hand-lost after a few frames to avoid false negatives
+                if no_hand_count > 3:
+                    action = self._pinch.on_hand_lost()
+                    if action is not None:
+                        self._execute_pinch_action(action)
+
+        mp_hands.close()
+
+    def _execute_pinch_action(self, action):
+        """Execute a pinch action at the current Kalman cursor position."""
+        if not self._kalman.initialized:
+            return
+        x, y = self._kalman.position()
+        action_type = action[0]
+        if action_type == "click":
+            click_mouse(x, y)
+        elif action_type == "drag_start":
+            mouse_down(x, y)
+        elif action_type == "drag_end":
+            mouse_up(x, y)
 
     def _match_screen_content(self, cam_feats, cam_w, cam_h, min_matches=7):
         """Match camera frame against per-monitor screenshots.
@@ -1219,7 +1447,34 @@ def handle_locate():
         "y": round(sy, 1),
         "matches": match_count,
         "confidence": round(confidence, 3),
+        "hand": gaze_tracker._pinch.state.value,
     })
+
+
+# ---------------------------------------------------------------------------
+# Hand tracking endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/hand_status", methods=["GET"])
+def handle_hand_status():
+    p = gaze_tracker._pinch
+    return jsonify({
+        "hand_detected": p.hand_detected,
+        "pinch_state": p.state.value,
+        "pinch_distance": round(p.distance, 4),
+        "last_action": p.last_action,
+        "last_action_time": p.last_action_time,
+        "enabled": gaze_tracker._hand_enabled,
+    })
+
+
+@app.route("/hand_tracking", methods=["POST"])
+def handle_hand_tracking():
+    data = request.json
+    enabled = data.get("enabled", True)
+    gaze_tracker._hand_enabled = bool(enabled)
+    print(f"[Hand] Tracking {'enabled' if enabled else 'disabled'}", flush=True)
+    return jsonify({"status": "ok", "enabled": gaze_tracker._hand_enabled})
 
 
 # ---------------------------------------------------------------------------
@@ -1234,5 +1489,6 @@ if __name__ == "__main__":
           f"({len(gaze_tracker._anchors)} anchors)")
     gaze_tracker.start_screen_capture()
     gaze_tracker.start_cursor_interpolation()
+    gaze_tracker.start_hand_detection()
     print(f"[CursorServer] Starting on http://0.0.0.0:8765")
     app.run(host="0.0.0.0", port=8765, threaded=True)

@@ -373,6 +373,8 @@ class GazeTracker:
         self._current_pos = None  # Current estimated screen position (x, y)
         self._scale_factor = 1.0  # Camera pixels -> screen pixels
         self._last_anchor_time = 0
+        self._frame_count = 0  # Frames since last anchor match
+        self._anchor_interval = 5  # Do anchor matching every N frames
 
         # Load saved calibration if exists
         self._load_calibration()
@@ -501,6 +503,10 @@ class GazeTracker:
     def locate(self, jpeg_bytes):
         """Locate gaze position using environment anchors + optical flow.
 
+        Strategy: optical flow every frame (~5ms), anchor matching every
+        N frames (~160ms) for absolute correction. This keeps latency low
+        while preventing drift.
+
         Returns (screen_x, screen_y, match_count, confidence) or None.
         """
         if not self.is_calibrated():
@@ -511,44 +517,63 @@ class GazeTracker:
             return None
 
         t0 = time.time()
+        self._frame_count += 1
 
-        # -- Optical flow: estimate motion from previous frame --
+        # -- Optical flow: fast path every frame --
         flow_dx, flow_dy = 0.0, 0.0
         if self._prev_gray is not None and self._current_pos is not None:
             flow_dx, flow_dy = self._compute_optical_flow(self._prev_gray, gray)
 
-        # -- Anchor matching: absolute position correction --
-        anchor_result = self._match_anchors(gray, cam_w, cam_h)
-
-        elapsed_ms = (time.time() - t0) * 1000
-
-        if anchor_result is not None:
-            sx, sy, mc, conf = anchor_result
-            self._current_pos = (sx, sy)
-            self._last_anchor_time = time.time()
-            self._prev_gray = gray
-            print(f"[locate] {elapsed_ms:.0f}ms ANCHOR x={sx:.0f} y={sy:.0f} "
-                  f"matches={mc} conf={conf:.2f}", flush=True)
-            return (sx, sy, mc, conf)
-
-        # No anchor match — use optical flow delta
+        # Apply flow immediately if we have a position
+        flow_applied = False
         if self._current_pos is not None and (flow_dx != 0 or flow_dy != 0):
             ox, oy = self._current_pos
             nx = ox - flow_dx * self._scale_factor
             ny = oy - flow_dy * self._scale_factor
-            # Clamp to screen bounds
             scr_ox, scr_oy, scr_w, scr_h = get_screen_size()
             nx = max(scr_ox, min(scr_ox + scr_w, nx))
             ny = max(scr_oy, min(scr_oy + scr_h, ny))
             self._current_pos = (nx, ny)
-            self._prev_gray = gray
-            age = time.time() - self._last_anchor_time
-            print(f"[locate] {elapsed_ms:.0f}ms FLOW dx={flow_dx:.1f} dy={flow_dy:.1f} "
-                  f"x={nx:.0f} y={ny:.0f} age={age:.1f}s", flush=True)
-            return (nx, ny, 0, 0.01)  # Low confidence for flow-only
+            flow_applied = True
+
+        # -- Anchor matching: periodic correction --
+        need_anchor = (
+            self._current_pos is None  # No position yet
+            or self._frame_count >= self._anchor_interval  # Time for correction
+            or time.time() - self._last_anchor_time > 2.0  # Stale position
+        )
+
+        if need_anchor:
+            self._frame_count = 0
+            anchor_result = self._match_anchors(gray, cam_w, cam_h)
+
+            if anchor_result is not None:
+                sx, sy, mc, conf = anchor_result
+                self._current_pos = (sx, sy)
+                self._last_anchor_time = time.time()
+                self._prev_gray = gray
+                elapsed_ms = (time.time() - t0) * 1000
+                print(f"[locate] {elapsed_ms:.0f}ms ANCHOR x={sx:.0f} y={sy:.0f} "
+                      f"matches={mc} conf={conf:.2f}", flush=True)
+                return (sx, sy, mc, conf)
 
         self._prev_gray = gray
-        print(f"[locate] {elapsed_ms:.0f}ms NO MATCH (no anchor, no flow)", flush=True)
+        elapsed_ms = (time.time() - t0) * 1000
+
+        # Return flow-updated position
+        if self._current_pos is not None:
+            nx, ny = self._current_pos
+            if flow_applied:
+                age = time.time() - self._last_anchor_time
+                if elapsed_ms > 20:  # Only log slow frames
+                    print(f"[locate] {elapsed_ms:.0f}ms FLOW x={nx:.0f} y={ny:.0f} "
+                          f"age={age:.1f}s", flush=True)
+                return (nx, ny, 0, 0.01)
+            else:
+                # No flow movement, return current position
+                return (nx, ny, 0, 0.01)
+
+        print(f"[locate] {elapsed_ms:.0f}ms NO MATCH", flush=True)
         return None
 
     def _match_anchors(self, cam_gray, cam_w, cam_h, min_matches=5):

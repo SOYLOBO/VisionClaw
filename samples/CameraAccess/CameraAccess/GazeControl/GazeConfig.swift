@@ -16,7 +16,7 @@ enum GazeConfig {
   }
 
   // Frame processing
-  static let gazeUpdateInterval: TimeInterval = 1.0 / 15.0  // 15 fps (pipelined)
+  static let gazeUpdateInterval: TimeInterval = 1.0 / 30.0  // 30 fps (most frames are fast optical-flow-only)
   static let smoothingFactor: Double = 0.15  // Exponential moving average (lower = smoother)
 
   // JPEG quality for /locate frames (0.0-1.0, lower = smaller payload, faster upload)

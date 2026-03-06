@@ -94,7 +94,7 @@ class GazeControlViewModel: ObservableObject {
       calibrationFrameData = image.jpegData(compressionQuality: 0.5)
       return
     }
-    guard isActive, inFlightCount < 2 else { return }
+    guard isActive, inFlightCount < 3 else { return }
 
     let now = Date()
     guard now.timeIntervalSince(lastSendTime) >= GazeConfig.gazeUpdateInterval else { return }

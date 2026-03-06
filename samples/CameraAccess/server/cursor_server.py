@@ -337,7 +337,7 @@ class ScreenshotCache:
         return (sx, sy, inliers, confidence)
 
 
-screenshot_cache = ScreenshotCache(refresh_interval=1.0, max_features=2000)
+screenshot_cache = ScreenshotCache(refresh_interval=1.0, max_features=10000)
 
 
 @app.route("/locate", methods=["POST"])

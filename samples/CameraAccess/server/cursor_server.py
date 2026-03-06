@@ -602,12 +602,23 @@ class GazeTracker:
                     # EMA smoothing: blend new result with current position
                     if self._current_pos is not None:
                         ox, oy = self._current_pos
+                        dx = sx - ox
+                        dy = sy - oy
+                        dist = math.sqrt(dx * dx + dy * dy)
+
+                        # Dead zone: if new result is very close, skip update
+                        if dist < 80:
+                            self._prev_gray = gray
+                            self._last_anchor_time = time.time()
+                            elapsed_ms = (time.time() - t0) * 1000
+                            return (ox, oy, mc, conf)
+
                         # Higher alpha for high-confidence results
                         alpha = self._ema_alpha
                         if conf > 0.6:
                             alpha = min(0.6, alpha * 1.5)
-                        sx = ox + (sx - ox) * alpha
-                        sy = oy + (sy - oy) * alpha
+                        sx = ox + dx * alpha
+                        sy = oy + dy * alpha
 
                     self._current_pos = (sx, sy)
                     self._last_anchor_time = time.time()
@@ -769,6 +780,11 @@ class GazeTracker:
         # Use median for robustness (rejects outliers from moving objects)
         dx = float(np.median(displacements[:, 0]))
         dy = float(np.median(displacements[:, 1]))
+
+        # Dead zone: ignore sub-pixel noise (camera sensor + JPEG artifacts)
+        mag = math.sqrt(dx * dx + dy * dy)
+        if mag < 1.5:
+            return 0.0, 0.0
 
         return dx, dy
 

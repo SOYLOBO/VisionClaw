@@ -324,6 +324,20 @@ def hide_calibration_dot():
         _dot_process = None
 
 
+def _kill_all_dot_processes():
+    """Kill any lingering DotView overlay processes."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "DotView"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for pid in result.stdout.strip().split("\n"):
+            if pid:
+                subprocess.run(["kill", pid], timeout=2)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Environment-Anchored Gaze Tracker
 # ---------------------------------------------------------------------------
@@ -455,6 +469,8 @@ class GazeTracker:
     def finish_calibration(self):
         """End calibration mode, save anchors, switch to tracking."""
         hide_calibration_dot()
+        # Kill any other lingering dot processes
+        _kill_all_dot_processes()
         with self._lock:
             self._calibrating = False
         self._save_calibration()

@@ -407,7 +407,7 @@ def handle_locate():
     elapsed_ms = (time.time() - t_start) * 1000
 
     # Filter out low-confidence results (bad homography)
-    if result and result[3] < 0.08:
+    if result and result[3] < 0.04:
         print(f"[locate] {elapsed_ms:.0f}ms x={result[0]:.0f} y={result[1]:.0f} matches={result[2]} conf={result[3]:.2f} REJECTED", flush=True)
         result = None
     elif result:

@@ -25,6 +25,7 @@ class GazeControlViewModel: ObservableObject {
   private var targetPoint: CGPoint?  // Where we're heading
   private var locateSeq: UInt64 = 0  // Pipelining: only accept latest result
   private var lastAppliedSeq: UInt64 = 0
+  private var inFlightCount: Int = 0
   private var interpolationTimer: Timer?
 
   // MARK: - Session Control
@@ -63,6 +64,7 @@ class GazeControlViewModel: ObservableObject {
     targetPoint = nil
     locateSeq = 0
     lastAppliedSeq = 0
+    inFlightCount = 0
     matchCount = 0
     confidence = 0.0
     NSLog("[GazeControl] Session stopped")
@@ -71,7 +73,7 @@ class GazeControlViewModel: ObservableObject {
   // MARK: - Frame Processing
 
   func processFrame(_ image: UIImage) {
-    guard isActive else { return }
+    guard isActive, inFlightCount < 2 else { return }
 
     let now = Date()
     guard now.timeIntervalSince(lastSendTime) >= GazeConfig.gazeUpdateInterval else { return }
@@ -81,11 +83,14 @@ class GazeControlViewModel: ObservableObject {
 
     locateSeq += 1
     let seq = locateSeq
+    inFlightCount += 1
 
     Task {
       let result = await cursorBridge.locateGaze(imageData: jpegData)
 
       await MainActor.run {
+        self.inFlightCount -= 1
+
         // Discard stale responses — only apply the latest
         guard seq > self.lastAppliedSeq else { return }
         self.lastAppliedSeq = seq

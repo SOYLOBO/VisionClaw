@@ -117,55 +117,47 @@ class GeminiLiveService: ObservableObject {
 
   func sendAudio(data: Data) {
     guard connectionState == .ready else { return }
-    sendQueue.async { [weak self] in
-      let base64 = data.base64EncodedString()
-      let json: [String: Any] = [
-        "realtimeInput": [
-          "audio": [
-            "mimeType": "audio/pcm;rate=16000",
-            "data": base64
-          ]
+    let base64 = data.base64EncodedString()
+    let json: [String: Any] = [
+      "realtimeInput": [
+        "audio": [
+          "mimeType": "audio/pcm;rate=16000",
+          "data": base64
         ]
       ]
-      self?.sendJSON(json)
-    }
+    ]
+    sendJSON(json)
   }
 
   func sendVideoFrame(image: UIImage) {
     guard connectionState == .ready else { return }
-    sendQueue.async { [weak self] in
-      guard let jpegData = image.jpegData(compressionQuality: GeminiConfig.videoJPEGQuality) else { return }
-      let base64 = jpegData.base64EncodedString()
-      let json: [String: Any] = [
-        "realtimeInput": [
-          "video": [
-            "mimeType": "image/jpeg",
-            "data": base64
-          ]
+    guard let jpegData = image.jpegData(compressionQuality: GeminiConfig.videoJPEGQuality) else { return }
+    let base64 = jpegData.base64EncodedString()
+    let json: [String: Any] = [
+      "realtimeInput": [
+        "video": [
+          "mimeType": "image/jpeg",
+          "data": base64
         ]
       ]
-      self?.sendJSON(json)
-    }
+    ]
+    sendJSON(json)
   }
 
   func sendToolResponse(_ response: [String: Any]) {
-    sendQueue.async { [weak self] in
-      self?.sendJSON(response)
-    }
+    sendJSON(response)
   }
 
   func sendTextMessage(_ text: String) {
     guard connectionState == .ready else { return }
-    sendQueue.async { [weak self] in
-      let msg: [String: Any] = [
-        "clientContent": [
-          "turns": [
-            ["role": "user", "parts": [["text": text]]]
-          ]
+    let msg: [String: Any] = [
+      "clientContent": [
+        "turns": [
+          ["role": "user", "parts": [["text": text]]]
         ]
       ]
-      self?.sendJSON(msg)
-    }
+    ]
+    sendJSON(msg)
   }
 
   // MARK: - Private
